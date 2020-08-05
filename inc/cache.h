@@ -3,6 +3,9 @@
 
 #include "memory_class.h"
 
+// Uncomment enable ideal L1I Cache
+// #define IDEAL_L1I
+
 // PAGE
 extern uint32_t PAGE_TABLE_LATENCY, SWAP_LATENCY;
 

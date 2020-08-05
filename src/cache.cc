@@ -628,7 +628,15 @@ void CACHE::handle_read()
 		reads_available_this_cycle--;
             }
             else { // read miss
-
+#ifdef IDEAL_L1I
+              // Push the fetched address packet to PROCESSED
+              // As a result, fetch completion is notified even when a read miss occurs while maintaining access to the lower cache.
+              if(cache_type == IS_L1I){
+                if (PROCESSED.occupancy < PROCESSED.SIZE){
+                  PROCESSED.add_queue(&RQ.entry[index]);
+                }
+              }
+#endif
                 DP ( if (warmup_complete[read_cpu]) {
                 cout << "[" << NAME << "] " << __func__ << " read miss";
                 cout << " instr_id: " << RQ.entry[index].instr_id << " address: " << hex << RQ.entry[index].address;
