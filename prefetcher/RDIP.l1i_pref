@@ -1,0 +1,325 @@
+// ===========================================================================
+//  Return-address-stack directed instruction prefetching (RDIP) for ChampSim
+//  Author: Tomoki Nakamura and Toru Koizumi
+// ===========================================================================
+#include "cache.h"
+#include "ooo_cpu.h"
+
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <memory>
+
+namespace { // anonymous
+
+#define Siggen Siggen_RasWhole<4>
+static constexpr size_t Distance = 2;
+static constexpr size_t N_Sets = 2048; // 1024 in the original configuration (63KiB)
+static constexpr size_t N_Ways = 4;
+static constexpr size_t N_Vectors = 3;
+static constexpr size_t VectorSize = 8;
+
+// utility functions
+
+template<size_t N>
+std::array<size_t, N> make_initialized_lru_order() {
+    std::array<size_t, N> ret;
+    std::iota(ret.begin(), ret.end(), 0);
+    return ret;
+}
+
+template<class T>
+void update_lru_order(T& lru_order, size_t touch_pos) noexcept {
+    assert(touch_pos < lru_order.size());
+    for (auto& e : lru_order) {
+        if (e < lru_order.at(touch_pos)) { ++e; }
+    }
+    lru_order.at(touch_pos) = 0;
+}
+
+template<size_t HistLen>
+class Siggen_RasWhole {
+    std::array<uint32_t, HistLen> ras = {};
+    size_t head = 0;
+
+    uint32_t makeSig() const noexcept {
+        uint32_t sig = 0;
+        for (size_t i = head; i < head + HistLen; ++i) {
+            sig = (sig << 24) | (sig >> 8);
+            sig ^= ras.at(i % HistLen);
+        }
+        return sig;
+    }
+public:
+    uint32_t onReturnInstruction(uint64_t, uint64_t) {
+        uint32_t sig = makeSig() ^ 1;
+        head = (head + HistLen - 1) % HistLen;
+        ras.at(head) = 0;
+        return sig;
+    }
+    uint32_t onCallInstruction(uint64_t ip, uint64_t) {
+        ras.at(head) = ip;
+        head = (head + 1) % HistLen;
+        return makeSig();
+    }
+};
+
+template<size_t VectorSize>
+class MissInfo {
+    uint64_t base_line_addr = 0;
+    std::array<bool, VectorSize> bit_vector = {};
+public:
+    bool add(uint64_t line_addr) noexcept {
+        if (base_line_addr != 0) {
+            const int64_t diff = line_addr - base_line_addr;
+            if (diff < 0) {
+                return false;
+            } else if (diff == 0) {
+                return true;
+            } else if (static_cast<size_t>(diff-1) < bit_vector.size()) {
+                bit_vector.at(diff-1) = true;
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            base_line_addr = line_addr;
+            return true;
+        }
+    }
+    bool isValid() const noexcept { return base_line_addr != 0; }
+    std::vector<uint64_t> getLineAddresses() const {
+        assert(isValid());
+        std::vector<uint64_t> ret;
+        ret.push_back(base_line_addr);
+        for (size_t i = 0; i < bit_vector.size(); ++i) {
+            if (bit_vector.at(i)) { ret.push_back(base_line_addr + (i+1)); }
+        }
+        return ret;
+    }
+};
+
+template<size_t N_Vectors, size_t VectorSize>
+class MissTableEntry {
+    std::array<MissInfo<VectorSize>, N_Vectors> elems = {};
+    std::array<size_t, N_Vectors> lru_order = make_initialized_lru_order<N_Vectors>();
+
+    void insert(uint64_t addr) noexcept {
+        const size_t victim_index = std::max_element(lru_order.begin(), lru_order.end()) - lru_order.begin();
+        assert(victim_index < N_Vectors);
+
+        elems.at(victim_index) = MissInfo<VectorSize> {};
+        const bool success = elems.at(victim_index).add(addr);
+        assert(success);
+
+        update_lru_order(lru_order, victim_index);
+    }
+    bool insert_or_touch_but_do_not_evict(uint64_t addr) {
+        for (size_t i = 0; i < N_Vectors; ++i) {
+            const bool success = elems.at(i).add(addr);
+            if (success) {
+                update_lru_order(lru_order, i);
+                return true;
+            }
+        }
+        return false;
+    }
+public:
+    void insert_or_touch(uint64_t addr) {
+        const bool success = insert_or_touch_but_do_not_evict(addr);
+        if (!success) { insert(addr); }
+    }
+    std::vector<MissInfo<VectorSize>> getValidEntries() const {
+        std::vector<MissInfo<VectorSize>> ret;
+        for (const auto& e : elems) {
+            if (e.isValid()) { ret.push_back(e); }
+        }
+        return ret;
+    }
+};
+
+template<size_t N_Ways, class T, class U, class Hasher>
+class FullyAssociativeLRUTable {
+    struct Entry {
+        size_t tag;
+        U value;
+        bool valid;
+        Entry() : tag(0), value(), valid(false) {}
+    };
+    std::array<Entry, N_Ways> table = {};
+    std::array<size_t, N_Ways> lru_order = make_initialized_lru_order<N_Ways>();
+
+    size_t find_index_of(const T& key) const {
+        const size_t tag = Hasher{}(key);
+        return std::find_if(table.begin(), table.end(), [tag](const Entry& entry) noexcept { return entry.valid && entry.tag == tag; }) - table.begin();
+    }
+public:
+    const U& operator[](const T& key) const {
+        assert(contains(key));
+        return table.at(find_index_of(key)).value;
+    }
+    U& operator[](const T& key) {
+        assert(contains(key));
+        return table.at(find_index_of(key)).value;
+    }
+
+    void touch(const T& key) {
+        assert(contains(key));
+        update_lru_order(lru_order, find_index_of(key));
+    }
+    void insert(const T& key, const U& elem) {
+        if (contains(key)) {
+            const size_t index = find_index_of(key);
+            table.at(index).value = elem;
+            touch(key);
+        } else {
+            const size_t victim_index = std::max_element(lru_order.begin(), lru_order.end()) - lru_order.begin();
+            table.at(victim_index).tag = Hasher{}(key);
+            table.at(victim_index).value = elem;
+            table.at(victim_index).valid = true;
+            touch(key);
+        }
+    }
+    bool contains(const T& key) const {
+        return find_index_of(key) != N_Ways;
+    }
+};
+
+template<size_t N_Sets, size_t N_Ways, class T, class U, class Hasher>
+class SetAssociativeLRUTable {
+    struct HasherForIndex { size_t operator()(const T& key) const { return Hasher{}(key) % N_Sets; } };
+    struct HasherForTag { size_t operator()(const T& key) const { return Hasher{}(key) / N_Sets; } };
+    using Entry = FullyAssociativeLRUTable<N_Ways, T, U, HasherForTag>;
+    std::array<Entry, N_Sets> table = {};
+public:
+    const U& operator[](const T& key) const { return table.at(HasherForIndex{}(key))[key]; }
+    U& operator[](const T& key) { return table.at(HasherForIndex{}(key))[key]; }
+    void touch(const T& key) { table.at(HasherForIndex{}(key)).touch(key); }
+    void insert(const T& key, const U& elem) { table.at(HasherForIndex{}(key)).insert(key, elem); }
+    bool contains(const T& key) const { return table.at(HasherForIndex{}(key)).contains(key); }
+};
+
+template<size_t N>
+class SignatureQueue {
+    std::array<uint32_t, N> queue = {};
+    size_t head = 0;
+public:
+    uint32_t front() const noexcept { return queue.at(head); }
+    uint32_t back() const noexcept { return queue.at((head + 1) % N); }
+    void insert(uint32_t x) noexcept { queue.at((head + 1) % N) = x; head = (head + 1) % N; }
+};
+
+
+class RDIP_PREFETCHER {
+    O3_CPU* pO3_CPU;
+    struct SigHasher { size_t operator()(const uint32_t& x) const noexcept { return x; } };
+
+    Siggen siggen = {};
+
+    SignatureQueue<Distance> sig_history = {};
+
+    SetAssociativeLRUTable<N_Sets, N_Ways, uint32_t, MissTableEntry<N_Vectors, VectorSize>, SigHasher> miss_table = {};
+
+public:
+    RDIP_PREFETCHER(O3_CPU* pO3_CPU);
+
+    void branch_operate(uint64_t ip, uint8_t branch_type, uint64_t branch_target);
+    void cache_operate(uint64_t addr, uint8_t cache_hit, uint8_t prefetch_hit);
+    void cycle_operate();
+    void final_stats();
+    void cache_fill(uint64_t v_addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_v_addr);
+};
+
+RDIP_PREFETCHER::RDIP_PREFETCHER(O3_CPU* pO3_CPU) : pO3_CPU(pO3_CPU) {
+    std::cout << "L1I RDIP has been constructed!" << std::endl;
+}
+
+void RDIP_PREFETCHER::branch_operate(uint64_t ip, uint8_t branch_type, uint64_t branch_target) {
+    uint32_t sig;
+
+    if (branch_type == BRANCH_DIRECT_CALL || branch_type == BRANCH_INDIRECT_CALL) {
+        sig = siggen.onCallInstruction(ip, branch_target);
+    } else if (branch_type == BRANCH_RETURN) {
+        sig = siggen.onReturnInstruction(ip, branch_target);
+    } else {
+        return;
+    }
+
+    // Signature updating and prefetching is performed only when both RAS state and signature is changed.
+    if (sig_history.front() == sig) {
+        return;
+    }
+
+    sig_history.insert(sig);
+
+    if (miss_table.contains(sig)) {
+        for (const auto& v : miss_table[sig].getValidEntries()) {
+            for (const uint64_t line_addr : v.getLineAddresses()) {
+                const uint64_t pf_addr = line_addr << LOG2_BLOCK_SIZE;
+                const int success = pO3_CPU->prefetch_code_line(pf_addr);
+            }
+        }
+    }
+}
+
+void RDIP_PREFETCHER::cache_operate(uint64_t addr, uint8_t cache_hit, uint8_t prefetch_hit) {
+    const bool miss = cache_hit == 0;
+
+    if (miss) {
+        const uint64_t line_addr = addr >> LOG2_BLOCK_SIZE;
+        const uint32_t sig = sig_history.back();
+
+        if (!miss_table.contains(sig)) {
+            miss_table.insert(sig, {});
+        } else {
+            miss_table.touch(sig);
+        }
+        miss_table[sig].insert_or_touch(line_addr);
+    }
+}
+
+void RDIP_PREFETCHER::cycle_operate()
+{
+}
+
+void RDIP_PREFETCHER::final_stats()
+{
+}
+
+void RDIP_PREFETCHER::cache_fill(uint64_t v_addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_v_addr)
+{
+}
+
+std::array<std::unique_ptr<RDIP_PREFETCHER>, NUM_CPUS> l1i_prefetcher;
+
+} // namespace anonymous
+
+void O3_CPU::l1i_prefetcher_initialize()
+{
+    ::l1i_prefetcher.at(cpu).reset(new ::RDIP_PREFETCHER(this));
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type, uint64_t branch_target)
+{
+    ::l1i_prefetcher.at(cpu)->branch_operate(ip, branch_type, branch_target);
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit, uint8_t prefetch_hit)
+{
+    ::l1i_prefetcher.at(cpu)->cache_operate(v_addr, cache_hit, prefetch_hit);
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_v_addr)
+{
+    ::l1i_prefetcher.at(cpu)->cache_fill(v_addr, set, way, prefetch, evicted_v_addr);
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate()
+{
+    ::l1i_prefetcher.at(cpu)->cycle_operate();
+}
+
+void O3_CPU::l1i_prefetcher_final_stats()
+{
+    ::l1i_prefetcher.at(cpu)->final_stats();
+}
